@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# 用法: occupy_gpu 0,1,3   (Ctrl+C 停止并释放)
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec python3 "$DIR/occupy_gpu.py" "$@"

@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# 杀掉所有 occupy_gpu 相关进程(主进程 + 每张卡的 worker 进程)。
+# 先 SIGTERM 优雅退出,5 秒后仍存活的再 SIGKILL。
+
+PATTERN="occupy_gpu.py"
+
+# 排除自身及父进程,避免命令行中含 PATTERN 的调用方(如包装 shell)被误杀
+mypgrep() {
+    pgrep -f "$PATTERN" | grep -vx -e "$$" -e "$PPID" || true
+}
+
+pids=$(mypgrep)
+if [ -z "$pids" ]; then
+    echo "没有找到 occupy_gpu 进程"
+    exit 0
+fi
+
+echo "找到 occupy_gpu 进程: $(echo $pids | tr '\n' ' ')"
+kill $pids 2>/dev/null
+
+for _ in $(seq 1 10); do
+    remain=$(mypgrep)
+    [ -z "$remain" ] && break
+    sleep 0.5
+done
+
+remain=$(mypgrep)
+if [ -n "$remain" ]; then
+    echo "以下进程未响应 SIGTERM,强制 SIGKILL: $(echo $remain | tr '\n' ' ')"
+    kill -9 $remain 2>/dev/null
+fi
+
+echo "已全部清理"
