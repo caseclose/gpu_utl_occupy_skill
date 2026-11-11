@@ -1,79 +1,55 @@
 # gpu_utl_occupy_skill
 
-GPU 占用工具 —— 把指定 GPU 的算力利用率拉满（100%）或限流到指定长期平均利用率（如 80%、5%），用于占住机器防止资源回收、保持 GPU 活跃等场景。
-
-已封装为 Claude / CodeBuddy Skill（见 [SKILL.md](SKILL.md)），也可作为独立命令行工具使用。
+用矩阵乘法在指定的 NVIDIA GPU、寒武纪 MLU 或华为昇腾 NPU 上产生计算负载。可以满载运行，也可以用 `--pct` 指定目标长期平均利用率。支持独立命令行和 [Claude / CodeBuddy Skill](SKILL.md)。
 
 ## 快速开始
 
+在目标 Linux 服务器上，激活对应厂商的 Python 环境后运行：
+
 ```bash
 cd scripts
-chmod +x occupy_gpu kill_occupy
-
-./occupy_gpu 0,1,3          # 把 0/1/3 卡利用率拉满(100%)
-./occupy_gpu 7 --pct 5      # 卡 7 长期平均约 5% 利用率
-./occupy_gpu all --pct 80   # 所有卡平均约 80%
-./occupy_gpu 7 --pct 5 -f   # 前台运行, Ctrl+C 停止
-./occupy_gpu.py --status    # 查看运行中的占卡进程与各卡利用率
-./kill_occupy               # 停止所有后台占卡进程
+./occupy_gpu 0,1 --pct 80              # 原有用法：默认 CUDA
+./occupy_gpu --backend mlu 0 --pct 20 -f  # 寒武纪，前台运行
+./occupy_gpu --backend npu 0 --pct 20 -f  # 昇腾，前台运行
 ```
 
-默认**后台运行**（双 fork 守护进程），日志追加在脚本同目录 `occupy_gpu.log`。
+以上为独立示例，选择符合硬件的一条。前台用 Ctrl+C 停止本次运行。省略 `-f` 时在后台运行，日志追加到 `scripts/occupy_gpu.log`。后台命令返回只表示已发起启动；检查各卡的 `running` 和后续日志确认运行情况。原有 `./kill_occupy` 会按脚本名停止匹配的占卡进程，**不区分后端或卡号**。
+
+## 环境和编号
+
+| `--backend` | 运行依赖 | `--status` 的设备数据来源 | 命令行卡号 |
+|---|---|---|---|
+| `cuda`（默认） | NVIDIA 驱动、CUDA 版 PyTorch | `nvidia-smi` | 沿用原有 CUDA 编号；`all` 从 nvidia-smi 枚举 |
+| `mlu` | 寒武纪驱动、Neuware、[配套的 PyTorch 和 torch_mlu](https://github.com/Cambricon/torch_mlu) | `cnmon` | 当前 PyTorch 可见的 MLU 逻辑编号 |
+| `npu` | 昇腾驱动、CANN、[配套的 PyTorch 和 torch_npu](https://github.com/Ascend/pytorch) | `npu-smi info` | 当前 PyTorch 可见的 NPU 逻辑编号 |
+
+MLU / NPU 继承当前进程的可见设备设置，不改写映射。例如容器只暴露一张卡时，应传 `0`，即使宿主机管理工具给这张卡的编号不是 0。`all` 只选当前后端的可见设备；它不检查设备是否已有作业。查询 MLU / NPU 的状态需要管理工具，但运行负载不依赖它。
 
 ## 参数
 
-| 参数 | 说明 | 默认 |
-|---|---|---|
-| `gpus` | GPU 编号，逗号分隔（如 `0,1,3`），或 `all` | 必填（除非 --status） |
-| `--pct` | 目标长期平均利用率 %（取值 (0, 100]） | 100（满载） |
-| `--period` | 占空比周期，秒。周期长则忙块大，nvidia-smi 读数更稳 | 10 |
-| `--size` | 矩阵边长，越大单 kernel 越重、显存越多 | 2048 |
-| `-f/--foreground` | 前台运行（默认后台） | 后台 |
-| `--status` | 查看运行中进程与各卡利用率 | - |
+| 参数 | 含义 |
+|---|---|
+| `--backend cuda\|mlu\|npu` | 默认 CUDA，不自动切换硬件 |
+| `gpus` | 逗号分隔的编号（如 `0,2`）或 `all`；除 `--status` 外必填 |
+| `--pct P` | 目标长期平均利用率，范围 (0, 100]，默认 100（满载） |
+| `--period S` | 忙闲周期，默认 10 秒；仅在限流时生效 |
+| `--size N` | 方阵边长，默认 2048。CUDA 使用 FP32，MLU / NPU 使用 FP16 |
+| `-f` / `--foreground` | 前台运行；省略时使用后台模式 |
+| `--status` | 列出匹配的工具进程，并显示所选后端的设备状态 |
 
-## 工作原理
+## 在目标机器上验证
 
-满载模式：循环提交小 kernel（matmul）把利用率顶满。
-
-限流模式：每 `period` 秒一个周期，先让 GPU **连续忙** `period × pct` 时长，再睡到周期结束，长期平均利用率闭环收敛到 `pct`。四个关键实现细节：
-
-1. **忙时必须是连续块** —— 碎片化的短 kernel 驱动利用率计数器采样不到，nvidia-smi 会恒显 0%；一个周期内所有 kernel 连续排队、末尾一次同步。
-2. **用 CUDA event 计时** —— GPU 执行时长与 CPU 墙钟差得很远，必须按 event 实测忙时做闭环。
-3. **burst 数用"流水线速率"估算** —— 同步执行与连续排队的单 kernel 耗时不同（流水线 overlap），启动时先排 128 个 kernel 实测速率再定每周期 kernel 数，避免 2 倍过冲。
-4. **闭环修正限幅** —— 用上一周期忙时误差修正下一周期预算，修正量限幅 ±50%，防止在"几乎不跑"和"连跑数秒"之间振荡。
-
-## 环境要求
-
-- Python 3
-- PyTorch（CUDA 版）：`pip install torch`
-- NVIDIA GPU + nvidia-smi
-
-## 验证占用率
-
-瞬时 `nvidia-smi` 读数会在忙窗口 ~100%、闲窗口 0% 之间跳（采样粒度下的正常现象），验证请看长期均值：
+例如验证昇腾卡 0（寒武纪把 `npu` 换成 `mlu`）：
 
 ```bash
-nvidia-smi dmon -i <GPU号> -s u -d 1 -c 300   # 5 分钟均值应接近 --pct
+./occupy_gpu --backend npu --status
+./occupy_gpu --backend npu 0 --size 1024 --pct 20 --period 5 -f
 ```
 
-或看日志中的闭环输出（`busy/period ≈ pct` 即达标）：
+在另一个终端运行 `npu-smi info`（MLU 用 `cnmon`），观察多个完整周期。20% 配 5 秒周期时，目标是每周期约 1 秒忙、4 秒闲；瞬时读数会波动。日志中的 `cycle: busy=...ms` 是设备事件测得的忙窗口，和厂商监控的整卡利用率是两个指标，不保证数值相同。Ctrl+C 后再查状态，确认这次运行的进程已经退出。
 
-```
-[GPU 7] cycle: busy=7999ms err=-1ms budget_next=8001ms   # 8s/10s = 80%
-```
+NVIDIA 可用 `nvidia-smi dmon -i 0 -s u -d 1 -c 300` 连续采样 5 分钟，取利用率列的均值。
 
-## 注意事项
+满载模式持续提交矩阵乘法。限流模式先连续提交 128 次矩阵乘法，估算每次用时，再按目标忙时安排每个周期的计算量；根据上个周期的事件耗时修正下个周期的预算，修正不超过目标忙时的 ±50%。重复启动会叠加负载，启动前请先确认目标卡可用。
 
-- **一台机器同时只跑一个实例**；重复启动会叠加进程（实际利用率超过目标），启动前先 `./kill_occupy`。
-- 满载模式会让 GPU 持续高功耗运行，注意机器散热与电费预算。
-- 结束任务用 `kill_occupy`（后台）或 Ctrl+C（前台），不要直接 `kill -9`。
-- 每卡显存占用约 473 MiB（2048×2048 fp32 矩阵 ×3）。
-
-## 文件说明
-
-| 文件 | 说明 |
-|---|---|
-| `SKILL.md` | Skill 清单（agent 触发描述 + 使用说明） |
-| `scripts/occupy_gpu.py` | 主脚本（满载 + 限流 + --status） |
-| `scripts/occupy_gpu` | bash 包装，等价 `python3 occupy_gpu.py` |
-| `scripts/kill_occupy` | 杀掉所有占卡进程（SIGTERM，5 秒后兜底 SIGKILL） |
+无硬件测试：在仓库根目录运行 `python3 -m unittest discover -s tests`。这些测试验证后端选择、卡号和运行流程；利用率和具体型号兼容性需要在真机上测量。
