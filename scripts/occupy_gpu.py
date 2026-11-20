@@ -5,7 +5,7 @@
     occupy_gpu.py <gpus> [--backend cuda|mlu|npu] [--pct 百分比] [--period 秒] [--size N] [-f]
 
 示例:
-    occupy_gpu.py 0,1,3          # 把 0/1/3 卡利用率拉满(100%)
+    occupy_gpu.py 0,1,3          # 0/1/3 卡使用默认目标 100%
     occupy_gpu.py 7 --pct 5      # 卡 7 长期平均约 5% 利用率
     occupy_gpu.py all --pct 20   # 所有卡平均约 20%
     occupy_gpu.py 7 --pct 5 -f   # 前台运行, Ctrl+C 停止
@@ -22,6 +22,7 @@ import math
 import multiprocessing as mp
 from multiprocessing.connection import wait
 import os
+import random
 import signal
 import subprocess
 import sys
@@ -34,6 +35,28 @@ STATUS_COMMANDS = {
     "mlu": ["cnmon"],
     "npu": ["npu-smi", "info"],
 }
+
+
+class UtilizationSchedule:
+    def __init__(self, target: float, period: float, start: float):
+        self.low = max(0.0, target - 8)
+        self.high = min(100.0, target + 8)
+        self.ramp = max(6.0, 2 * period)
+        self.minimum_hold = max(18.0, period)
+        self.previous = self.destination = target
+        self.started = self.next_change = start
+        self.random = random.Random()
+
+    def rate(self, now: float) -> float:
+        if now >= self.next_change:
+            self.previous = self.destination
+            while abs(self.destination - self.previous) < 3:
+                self.destination = self.random.uniform(self.low, self.high)
+            self.started = now
+            self.next_change = now + self.ramp + self.minimum_hold + self.random.uniform(0, 16)
+        fraction = min(1.0, (now - self.started) / self.ramp)
+        blend = fraction * fraction * (3 - 2 * fraction)
+        return self.previous + (self.destination - self.previous) * blend
 
 
 def worker(card: int, size: int, pct: float, period: float, backend: str):
@@ -63,18 +86,9 @@ def worker(card: int, size: int, pct: float, period: float, backend: str):
     print(f"{tag} running, pid={os.getpid()}, "
           f"tensor={size}x{size} {dtype}, target={pct}%", flush=True)
 
-    if pct >= 100:
-        # 满载模式: 循环小 kernel 把利用率顶满(与 v1 行为一致)
-        # 不重新赋值给 a, 避免数值发散
-        while True:
-            for _ in range(20):
-                torch.matmul(a, b, out=out)
-            runtime.synchronize()
-        return
-
     # 限流模式: 每 period 秒一个周期, 先让 GPU 连续忙
-    # period*pct 时长(用设备 event 实测忙时, 不用 CPU 墙钟),
-    # 再睡到周期结束 → 长期平均利用率 ≈ pct。
+    # period * 当前调度利用率的时长(用设备 event 实测忙时),
+    # 再睡到周期结束。
     # 忙时必须是"连续块"而不是碎片 kernel, 否则驱动利用率计数器
     # 采样不到, nvidia-smi 会显示 0%。
     target_busy = period * pct / 100.0
@@ -94,8 +108,7 @@ def worker(card: int, size: int, pct: float, period: float, backend: str):
     # 每周期把忙时打成一个连续块(碎片化会被 nvidia-smi 漏计)。
     # 块速率用"连续排队"实测(与同步校准值不同: 流水线 overlap 使
     # 连续执行的单 kernel 更快), 避免按同步值排队导致 2 倍过冲。
-    # 闭环: 用上一周期 busy 误差修正下一周期预算, 但修正量限幅
-    # ±50%, 防止极端振荡; 长期平均收敛到 target_busy / period = pct。
+    # 闭环: 用上一周期 busy 误差修正下一周期预算, 修正量限幅 ±50%。
     N_CAL = 128
     ev0.record()
     for _ in range(N_CAL):
@@ -105,10 +118,20 @@ def worker(card: int, size: int, pct: float, period: float, backend: str):
     t_per_k = max(ev0.elapsed_time(ev1) / 1000.0 / N_CAL, 1e-6)
     print(f"{tag} pipelined kernel={t_per_k*1000:.2f}ms", flush=True)
 
-    budget = target_busy
+    schedule = UtilizationSchedule(pct, period, time.monotonic()) if pct > 20 else None
+    if schedule is not None:
+        min_budget = period * schedule.low / 100.0
+        max_budget = period * schedule.high / 100.0
+    error = 0.0
     log_n = 0
     while True:
         t0 = time.monotonic()
+        if schedule is not None:
+            target_busy = period * schedule.rate(t0) / 100.0
+        correction = max(-0.5 * target_busy, min(0.5 * target_busy, -error))
+        budget = max(2 * t_per_k, target_busy + correction) if log_n else target_busy
+        if schedule is not None:
+            budget = min(max_budget, max(min_budget, budget))
         n_burst = max(1, round(budget / t_per_k))
         ev0.record()
         for _ in range(n_burst):
@@ -116,12 +139,10 @@ def worker(card: int, size: int, pct: float, period: float, backend: str):
         ev1.record()
         runtime.synchronize()
         busy = ev0.elapsed_time(ev1) / 1000.0
-        err = busy - target_busy              # 秒; 正=过冲 负=欠账
-        corr = max(-0.5 * target_busy, min(0.5 * target_busy, -err))
-        budget = max(2 * t_per_k, target_busy + corr)
+        error = busy - target_busy  # 秒; 正=过冲 负=欠账
         if log_n < 5 or log_n % 50 == 0:
             print(f"{tag} cycle: busy={busy*1000:.0f}ms "
-                  f"err={err*1000:+.0f}ms budget_next={budget*1000:.0f}ms",
+                  f"err={error*1000:+.0f}ms budget={budget*1000:.0f}ms",
                   flush=True)
         log_n += 1
         time.sleep(max(0.0, period - (time.monotonic() - t0)))
@@ -207,15 +228,14 @@ def daemonize(log_path: str):
 def main():
     p = argparse.ArgumentParser(
         prog="occupy_gpu",
-        description="占卡:默认算力利用率拉满;--pct 指定长期平均利用率(默认后台运行)")
+        description="占卡:--pct 指定目标利用率(默认 100%，后台运行)")
     p.add_argument("gpus", nargs="?", help="设备编号,逗号分隔,如 0,1,3;或 all")
     p.add_argument("--backend", choices=LABELS, default="cuda",
                    help="设备后端 (默认 cuda; MLU / NPU 使用 PyTorch 可见的逻辑编号)")
     p.add_argument("--pct", type=float, default=100.0,
-                   help="目标长期平均利用率%% (默认 100 即满载)")
+                   help="目标利用率%% (默认 100；目标超过 20 时分段波动)")
     p.add_argument("--period", type=float, default=10.0,
-                   help="占空比周期,秒 (默认 10, 仅 pct<100 时生效; "
-                        "周期长则忙块大)")
+                   help="占空比周期,秒 (默认 10；周期长则忙块大)")
     p.add_argument("--size", type=int, default=2048,
                    help="矩阵边长,越大单 kernel 越重、显存越多 (默认 2048)")
     p.add_argument("-f", "--foreground", action="store_true",

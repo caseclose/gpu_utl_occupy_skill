@@ -1,14 +1,37 @@
 """CLI integration tests with fake device runtimes. No vendor SDK or hardware required."""
 import os
 from pathlib import Path
+import random
 import signal
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "occupy_gpu.py"
+sys.path.insert(0, str(SCRIPT.parent))
+from occupy_gpu import UtilizationSchedule
+
+
+class UtilizationSchedules(unittest.TestCase):
+    def test_clipped_bounds_ramp_and_hold(self):
+        for target in (20.5, 90, 97, 100):
+            with self.subTest(target=target):
+                with patch("occupy_gpu.random.Random", return_value=random.Random(42)):
+                    schedule = UtilizationSchedule(target, 10, 0)
+                initial = schedule.rate(0)
+                halfway = schedule.rate(10)
+                held = schedule.rate(20)
+                self.assertEqual(initial, target)
+                self.assertNotEqual(held, initial)
+                self.assertAlmostEqual(halfway, (initial + held) / 2)
+                self.assertEqual(schedule.rate(30), held)
+                self.assertEqual(schedule.rate(schedule.next_change), held)
+                values = [schedule.rate(t) for t in range(60, 1800)]
+                self.assertGreaterEqual(min(values), target - 8 - 1e-9)
+                self.assertLessEqual(max(values), min(100, target + 8) + 1e-9)
 
 # Expose only the requested backend. A wrong extension, device, dtype or event
 # stream fails the worker, just as a missing SDK or wrong current device would.
@@ -80,7 +103,7 @@ class Backends(unittest.TestCase):
             try:
                 deadline = time.monotonic() + 8
                 label = "GPU" if backend == "cuda" else backend.upper()
-                marker = "cycle: busy=10ms" if pct == 20 else "running"
+                marker = f"cycle: busy={round(pct / 2)}ms"
                 while time.monotonic() < deadline:
                     data = log.read_text()
                     if all(f"[{label} {card}] {marker}" in data for card in cards):
@@ -101,8 +124,9 @@ class Backends(unittest.TestCase):
 
     def test_cuda_default(self):
         self.exercise("cuda", "3", 20, [3])
+        self.exercise("cuda", "3", 90, [3])
 
-    def test_mlu_and_npu_all_and_full_load(self):
+    def test_mlu_and_npu_all_and_maximum_target(self):
         for b in ("mlu", "npu"):
             with self.subTest(backend=b):
                 self.exercise(b, "all", 20, [0, 1])
