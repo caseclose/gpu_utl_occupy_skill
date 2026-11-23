@@ -1,4 +1,4 @@
-"""Run a local NVIDIA telemetry collector or operate on its private state."""
+"""Run a local accelerator collector or operate on its private state."""
 import argparse
 import fcntl
 import json
@@ -8,6 +8,7 @@ import sys
 import time
 
 from collector import publish, supervise
+from vendor import load_device_map
 
 
 def read(path, default=None):
@@ -66,8 +67,8 @@ def update(directory, payload):
         latest = read(directory / "latest.json")
         if not latest or not latest["controllable"] or time.time() - latest["time"] > 30:
             return dict(ok=False, status=409, error="节点未启用控制或采集数据已过期")
-        if set(cards) - {device["uuid"] for device in latest["gpus"]}:
-            raise ValueError("选中的 GPU 已不在节点中")
+        if set(cards) - {device["uuid"] for device in latest["gpus"] if device.get("controllable", True)}:
+            raise ValueError("选中的卡已离线或未启用控制")
         config = read(path)
         if config is None or config["revision"] != rev:
             return dict(ok=False, status=409, error="设置已更新，请刷新后重试")
@@ -86,14 +87,26 @@ def main():
     parser.add_argument("action", choices=("collect", "snapshot", "update"))
     parser.add_argument("--state", type=Path, default=Path.home() / ".local/state/gpu-occupy/dashboard")
     parser.add_argument("--pulse", type=Path, help="optional compiled pulse executable for control")
+    parser.add_argument("--backend", choices=("cuda", "mlu", "npu"), default="cuda")
+    parser.add_argument("--device-map", type=Path,
+                        help="opt in to MLU/NPU control using a JSON monitor ID to logical index map")
+    parser.add_argument("--size", type=int, default=2048, help="MLU/NPU worker matrix edge length")
     args = parser.parse_args()
     directory = args.state.expanduser().resolve()
     os.umask(0o077)
     if args.action == "collect":
         pulse = args.pulse.expanduser().resolve() if args.pulse else None
+        if (args.backend == "cuda" and args.device_map) or (args.backend != "cuda" and pulse):
+            parser.error("use --pulse for CUDA and --device-map for MLU/NPU")
+        if args.size < 1:
+            parser.error("--size must be positive")
         if pulse and (not pulse.is_file() or not os.access(str(pulse), os.X_OK)):
             parser.error("--pulse must point to an executable file")
-        supervise(directory, pulse)
+        try:
+            mapping = load_device_map(args.device_map.expanduser(), args.backend) if args.device_map else None
+        except (OSError, ValueError) as error:
+            parser.error(str(error))
+        supervise(directory, pulse, args.backend, mapping, args.size)
         return
     if args.action == "snapshot":
         result = snapshot(directory)

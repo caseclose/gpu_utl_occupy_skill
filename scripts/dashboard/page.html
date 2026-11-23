@@ -2,27 +2,32 @@
 <html lang="zh-CN" data-theme="dark">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>NVIDIA GPU 监控</title><link rel="stylesheet" href="/style.css">
+<title>加速卡监控</title><link rel="stylesheet" href="/style.css">
 <script src="/app.js" defer></script>
 </head>
 <body>
-<header class="topbar"><div class="nav"><strong>GPU 监控</strong><span class="nav-sub">NVIDIA</span><span id="connection" role="status">正在读取数据</span><span id="clock"></span></div></header>
+<header class="topbar"><div class="nav"><strong>加速卡监控</strong><span id="connection" role="status">正在读取数据</span><span id="clock"></span><select id="theme" aria-label="显示主题"><option value="system">跟随系统</option><option value="light">浅色</option><option value="dark">深色</option></select></div></header>
 <main class="shell">
-  <section class="intro"><div><h1>GPU 节点</h1><p>每 10 秒采集 · 上海时间</p></div><div id="updated"></div></section>
+  <section class="intro"><div><h1>加速卡节点</h1><p>每 10 秒采集 · 上海时间</p></div><div id="updated"></div></section>
   <div id="summary" class="stats">
-    <div class="stat"><div class="stat-v">—</div><div class="stat-k">在线 GPU</div></div>
+    <div class="stat"><div class="stat-v">—</div><div class="stat-k">在线加速卡</div></div>
     <div class="stat"><div class="stat-v">—</div><div class="stat-k">平均利用率</div></div>
     <div class="stat"><div class="stat-v">—</div><div class="stat-k">已用显存</div></div>
-    <div class="stat"><div class="stat-v">—</div><div class="stat-k">GPU 进程记录</div></div>
+    <div class="stat"><div class="stat-v">—</div><div class="stat-k">加速卡进程记录</div></div>
   </div>
+
+  <details class="panel overview">
+    <summary>集群总览</summary>
+    <div class="table-wrap"><table aria-label="集群总览"><thead><tr><th>节点</th><th>状态</th><th>在线 / 总卡数</th><th>平均利用率</th><th>已用显存</th><th>占卡中 / 让出</th><th>最近采样</th></tr></thead><tbody id="overview-rows"></tbody></table></div>
+  </details>
   <div id="nodes" class="node-grid" aria-label="选择节点"></div>
   <div class="workbench">
     <section class="panel"><div class="panel-title"><h2>逐卡状态</h2><span id="node-label"></span></div>
-      <div class="table-wrap"><table id="gpu-table"><thead><tr><th>GPU</th><th>计算利用率</th><th>已用 / 总显存</th><th>温度</th><th>功耗</th><th>占卡设置</th></tr></thead><tbody></tbody></table></div>
+      <div class="table-wrap"><table id="gpu-table"><thead><tr><th>设备</th><th>计算利用率</th><th>已用 / 总显存</th><th>温度</th><th>功耗</th><th>占卡设置</th></tr></thead><tbody></tbody></table></div>
     </section>
     <section class="panel controls"><div class="panel-title"><h2>占卡控制</h2><span id="control-source"></span></div>
       <form id="control">
-        <fieldset><legend>选择 GPU</legend><div id="cards"></div><button class="plain" id="select-all" type="button">全选</button></fieldset>
+        <fieldset><legend>选择加速卡</legend><div class="card-selection"><div id="cards"></div><div id="card-marquee" hidden aria-hidden="true"></div></div><button class="plain" id="select-all" type="button">全选</button></fieldset>
         <label for="target">目标利用率</label><div class="number"><input id="target" type="number" min="1" max="100" value="20" required><span>%</span></div>
         <div class="actions"><button type="submit" id="apply">开启 / 更新</button><button type="button" id="disable">关闭占卡</button></div>
         <div id="notice" aria-live="polite"></div>
@@ -30,17 +35,29 @@
       <p class="control-note">设置在下一次采样时生效。利用率受任务负载和采样窗口影响。</p>
     </section>
   </div>
-  <section class="panel trend"><div class="panel-title"><h2>利用率与显存趋势</h2><label>GPU <select id="trend-card" aria-label="趋势 GPU"></select></label></div>
+  <section class="panel trend"><div class="panel-title"><h2>利用率与显存趋势</h2><label>设备 <select id="trend-card" aria-label="趋势设备"></select></label></div>
     <div class="legend"><span><i></i>计算利用率</span><span><i></i>显存占用比例</span><span id="trend-label"></span></div>
     <canvas id="line" height="230" role="img" aria-label="最近一小时的利用率和显存趋势"></canvas><div id="trend-empty" hidden>正在等待历史采样</div>
   </section>
   <section class="panel processes">
-    <div class="panel-title"><h2>GPU 进程</h2><label>类型 <select id="category"><option value="">全部</option><option>占卡</option><option>训练</option><option>推理</option><option>未知</option></select></label></div>
+    <div class="panel-title"><h2>加速卡进程</h2><label>类型 <select id="category"><option value="">全部</option><option>占卡</option><option>训练</option><option>推理</option><option>未知</option></select></label></div>
     <div class="process-tabs"><button id="tab-live" type="button" aria-pressed="true">当前进程</button><button id="tab-history" type="button" aria-pressed="false">近期变动</button></div>
-    <div class="table-wrap"><table id="proc-table"><thead><tr><th>GPU</th><th>驱动 PID</th><th>容器 PID</th><th>类型</th><th>进程显存</th><th>时间</th><th>归因依据</th></tr></thead><tbody></tbody></table></div>
+    <div class="table-wrap"><table id="proc-table"><thead><tr><th>设备</th><th>驱动 PID</th><th>容器 PID</th><th>类型</th><th>进程显存</th><th>时间</th><th>归因依据</th></tr></thead><tbody></tbody></table></div>
     <details id="candidates" hidden><summary>容器内疑似任务</summary><ul></ul></details>
     <p class="footnote">监测日志保留约 7 天。PID 命名空间不同或线索不足时，显示推定或未知。</p>
   </section>
 </main>
+<dialog id="node-note-dialog" aria-labelledby="node-note-title">
+  <form method="dialog">
+    <h2 id="node-note-title">编辑节点备注</h2>
+    <p id="node-note-id" class="muted"></p>
+    <label for="node-note-input">备注名</label>
+    <input id="node-note-input" type="text" maxlength="40" placeholder="留空则恢复默认名称" autocomplete="off" autofocus>
+    <div class="actions">
+      <button value="save" type="submit">保存</button>
+      <button value="cancel" type="submit">取消</button>
+    </div>
+  </form>
+</dialog>
 </body>
 </html>

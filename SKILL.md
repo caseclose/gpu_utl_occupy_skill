@@ -1,6 +1,6 @@
 ---
 name: gpu-occupy
-description: 在指定 NVIDIA GPU、寒武纪 MLU 或华为昇腾 NPU 上产生矩阵运算负载，支持多卡和目标平均利用率。用户要求占卡、调整负载、查看设备状态或使用 NVIDIA 网页看板时使用。
+description: 在指定 NVIDIA GPU、寒武纪 MLU 或华为昇腾 NPU 上产生负载，支持多卡和目标利用率。用户要求占卡、调整负载、查看设备状态或使用加速卡网页看板时使用。
 ---
 
 # 加速卡占用
@@ -19,6 +19,6 @@ description: 在指定 NVIDIA GPU、寒武纪 MLU 或华为昇腾 NPU 上产生�
 - `-f` 表示前台运行，Ctrl+C 仅停止本次实例。后台日志在 `scripts/occupy_gpu.log`；启动命令返回后，查看每张卡的日志确认 worker 已运行。原有 `./kill_occupy` 按脚本名停止进程，不区分后端或卡号。
 - Python 环境须匹配硬件。MLU 需要 PyTorch 和 `torch_mlu`；NPU 需要 CANN、PyTorch 和 `torch_npu`。探测失败时报告具体错误，不要换后端代跑。
 
-用户要持续监控、查 GPU 进程来源或从浏览器控制 NVIDIA 占卡时，使用 [网页看板](references/dashboard.md)。在目标节点采集，在查看端启动本机网页。默认只读，显式启用控制后，根据用户指定的 GPU 和目标利用率操作。
+用户要持续监控、查设备进程来源或从浏览器控制占卡时，使用 [网页看板](references/dashboard.md)。在目标节点按硬件选择采集后端，在查看端启动本机网页。默认只读。NVIDIA 用 CUDA worker 启用控制，MLU 和 NPU 要先核对监控设备与 PyTorch 逻辑编号的对应关系。
 
 完整参数和真机验收步骤见 [README.md](README.md)。

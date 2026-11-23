@@ -1,4 +1,4 @@
-"""Collect telemetry on a device host and manage only this controller's CUDA workers."""
+"""Collect accelerator telemetry and manage only this collector's workers."""
 from collections import Counter
 import csv
 from datetime import datetime
@@ -11,6 +11,8 @@ import re
 import signal
 import subprocess
 import time
+
+import vendor
 
 INTERVAL = 10
 RETENTION_DAYS = 7
@@ -208,13 +210,43 @@ def mark_stop(signum, frame):
     running = False
 
 
-def reconcile_workers(gpus, processes, config, pulse, workers):
+def vendor_process_rows(cards, reported, workers):
+    own = {}
+    for uuid, (worker, _) in workers.items():
+        if worker.poll() is not None:
+            continue
+        try:
+            lines = Path(f"/proc/{worker.pid}/status").read_text().splitlines()
+            ids = next((line.split()[1:] for line in lines if line.startswith("NSpid:")), [])
+        except OSError:
+            continue
+        own[uuid] = (worker.pid, {worker.pid, *map(int, ids)})
+    result = []
+    for key, pid, container_pid, raw_command, memory in reported:
+        if key not in cards:
+            continue
+        card = cards[key]
+        local, ids = own.get(card["uuid"], (None, set()))
+        managed = container_pid == local if container_pid is not None else pid in ids
+        command = raw_command.split(maxsplit=1)[0].rsplit("/", 1)[-1] if raw_command else ""
+        command = command if SAFE.fullmatch(command) else None
+        category, marker = badged_commands([], command or "")
+        result.append(dict(gpu=card["index"], pid=pid, local_pid=local if managed else container_pid,
+                           label=card["label"], command=command, memory=memory, managed=managed,
+                           category="占卡" if managed else category,
+                           confidence="已匹配" if managed else "推定" if marker else "未知",
+                           evidence="厂商进程记录匹配受管进程" if managed else "厂商工具上报的进程记录"))
+    return result
+
+
+def reconcile_workers(gpus, processes, config, pulse, workers, vendor_run=None):
+    vendor_mode = vendor_run is not None
     index_uuid = {gpu["index"]: gpu["uuid"] for gpu in gpus}
     for uuid in workers.keys() - index_uuid.values():
         stop(workers.pop(uuid)[0])
     counts = Counter(p["gpu"] for p in processes)
     external = {p["gpu"] for p in processes if not p["managed"]
-                and (index_uuid[p["gpu"]] not in workers or counts[p["gpu"]] > 1
+                and (vendor_mode or index_uuid[p["gpu"]] not in workers or counts[p["gpu"]] > 1
                      or p["confidence"] == "已匹配")}
     for card in gpus:
         index = card["index"]
@@ -222,23 +254,25 @@ def reconcile_workers(gpus, processes, config, pulse, workers):
         desired = config["cards"].get(uuid, {"enabled": False, "target": 20})
         child = workers.get(uuid)
         threshold = min(100, desired["target"] * 2 + 4) if child else desired["target"]
-        paused = desired["enabled"] and index in external and (card["util"] or 0) >= threshold
-        want = bool(pulse and desired["enabled"] and not paused)
+        paused = desired["enabled"] and index in external and (vendor_mode or (card["util"] or 0) >= threshold)
+        controllable = card["controllable"] if vendor_mode else bool(pulse)
+        want = controllable and desired["enabled"] and not paused
         if child and (not want or child[1] != desired["target"] or child[0].poll() is not None):
             stop(workers.pop(uuid)[0])
             child = None
         if want and child is None:
-            child = (subprocess.Popen(
+            worker = vendor_run(card, desired["target"]) if vendor_mode else subprocess.Popen(
                 [str(pulse), str(desired["target"])],
                 env=dict(os.environ, CUDA_VISIBLE_DEVICES=card["uuid"]),
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            ), desired["target"])
+            )
+            child = (worker, desired["target"])
             workers[uuid] = child
         card.update(requested=desired, worker_pid=child[0].pid if child else None,
                     worker_state="running" if child else "yielding" if paused else "off")
 
 
-def supervise(directory, pulse=None):
+def supervise(directory, pulse=None, backend="cuda", device_map=None, size=2048):
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     status_path = directory / "latest.json"
     config_path = directory / "config.json"
@@ -256,15 +290,27 @@ def supervise(directory, pulse=None):
         except (OSError, KeyError, ValueError):
             pass
         cleanup_at = 0
+
+        def vendor_run(card, target):
+            return vendor.launch(backend, device_map[card["uuid"]], target, size)
+
         try:
             while running:
                 started = time.monotonic()
                 now = int(time.time())
                 try:
                     config = json.loads(config_path.read_text(encoding="utf-8"))
-                    gpus = read_gpus()
-                    processes, candidates = process_rows(gpus, workers)
-                    reconcile_workers(gpus, processes, config, pulse, workers)
+                    if backend == "cuda":
+                        gpus = read_gpus()
+                        processes, candidates = process_rows(gpus, workers)
+                    else:
+                        cards, reported, complete = vendor.sample(backend)
+                        gpus = sorted(cards.values(), key=lambda card: card["index"])
+                        for card in gpus:
+                            card["controllable"] = complete and card["util"] is not None and card["uuid"] in (device_map or {})
+                        processes, candidates = vendor_process_rows(cards, reported, workers), []
+                    reconcile_workers(gpus, processes, config, pulse, workers,
+                                      vendor_run if backend != "cuda" else None)
                     current = {}
                     for p in processes:
                         # GPU index and observed PID allow consistency even when namespace metadata becomes available later.
@@ -283,9 +329,13 @@ def supervise(directory, pulse=None):
                     for key in active.keys() - current.keys():
                         append(directory, "events", dict(time=now, action="离开", **active[key]), now)
                     active = current
-                    publish(status_path, dict(time=now, controllable=bool(pulse), gpus=gpus,
+                    control_available = bool(pulse) if backend == "cuda" else any(g["controllable"] for g in gpus)
+                    publish(status_path, dict(time=now, backend=backend, controllable=control_available, gpus=gpus,
                                               processes=processes, candidates=candidates, revision=config["revision"]))
-                    append(directory, "metrics", dict(t=now, g={g["index"]: [g[k] for k in ("util", "used", "total", "temp", "power")] for g in gpus}), now)
+                    append(directory, "metrics", dict(t=now, g={
+                        (g["index"] if backend == "cuda" else g["uuid"]):
+                        [g[k] for k in ("util", "used", "total", "temp", "power")] for g in gpus
+                    }), now)
                     if now - cleanup_at >= 3600:
                         cutoff = datetime.utcfromtimestamp(now - RETENTION_DAYS * 86400).strftime("%Y-%m-%d")
                         for path in directory.glob("*.ndjson"):
@@ -293,6 +343,10 @@ def supervise(directory, pulse=None):
                                 path.unlink()
                         cleanup_at = now
                 except (OSError, ValueError, KeyError, AssertionError, subprocess.SubprocessError) as exc:
+                    if backend != "cuda":
+                        for worker, _ in workers.values():
+                            stop(worker)
+                        workers.clear()
                     publish(directory / "health.json", dict(time=now, error=type(exc).__name__))
                     print("sample failed: {}".format(type(exc).__name__), flush=True)
                 deadline = started + INTERVAL
