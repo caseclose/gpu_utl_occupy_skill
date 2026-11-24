@@ -14,10 +14,11 @@ const avg = values => {
   return known.length ? known.reduce((a,b)=>a+b,0)/known.length : null;
 };
 const sum = values => values.filter(Number.isFinite).reduce((a,b)=>a+b,0);
-const scope = {snapshot:{nodes:[]}, node:0, card:0, history:false, posting:false, reading:false, pending:null, disconnected:false};
+const scope = {snapshot:{nodes:[]}, node:null, card:0, history:false, posting:false, reading:false, pending:null, disconnected:false};
 const selections = new Map();
 const stale = node => !node?.latest || node.connection_error || Date.now()/1000 - node.latest.time > 30;
-const current = () => scope.snapshot.nodes[scope.node];
+const findNode = id => scope.snapshot.nodes.find(node=>node.name===id);
+const current = () => findNode(scope.node) ?? scope.snapshot.nodes[0];
 function chosen() {
   const name=current()?.name;
   if (!selections.has(name)) selections.set(name,new Set());
@@ -33,6 +34,15 @@ const classFor = category => ({占卡:"keepalive",训练:"training",推理:"infe
 const nodeKey=node=>node.name;
 const nodeNotes=new Map();
 const nodeNotesKey="gpu-dashboard-node-notes";
+const nodeOrderKey="gpu-dashboard-node-order";
+const nodeGrid=$("nodes");
+const overviewRows=$("overview-rows");
+const nodeOrderViews=[nodeGrid,overviewRows];
+let nodeOrder=[], nodeDrag=null;
+try {
+  const saved=JSON.parse(localStorage.getItem(nodeOrderKey));
+  if (Array.isArray(saved)) nodeOrder=[...new Set(saved.filter(id=>typeof id==="string"))];
+} catch {}
 try {
   const saved=JSON.parse(localStorage.getItem(nodeNotesKey) || "{}");
   for (const [id,note] of Object.entries(saved)) {
@@ -44,15 +54,47 @@ function nodeTitle(node) {
   return nodeNotes.get(nodeKey(node)) ?? node.name;
 }
 
+function orderedNodes() {
+  const nodes=new Map(scope.snapshot.nodes.map(node=>[nodeKey(node),node]));
+  const ordered=[];
+  for (const id of nodeOrder) {
+    if (nodes.has(id)) {
+      ordered.push(nodes.get(id));
+      nodes.delete(id);
+    }
+  }
+  return ordered.concat([...nodes.values()]);
+}
+
+function moveNode(id, destination) {
+  const order=orderedNodes().map(nodeKey);
+  const from=order.indexOf(id), to=order.indexOf(destination);
+  if (from===-1 || to===-1 || from===to) return;
+  order.splice(from,1);
+  order.splice(to,0,id);
+  nodeOrder=order;
+  try { localStorage.setItem(nodeOrderKey,JSON.stringify(order)); } catch {}
+  count($("node-order-status"),`${nodeTitle(findNode(id))} 已移到第 ${to+1} 位`);
+}
+
+function nodeGrip(node,disabled) {
+  const id=escape(nodeKey(node));
+  return `<button class="node-grip" type="button" data-node-grip="${id}"
+    aria-label="调整 ${escape(nodeTitle(node))}（${id}）的位置"
+    aria-keyshortcuts="ArrowUp ArrowDown ArrowLeft ArrowRight" title="拖动排序，也可以用方向键"
+    ${disabled?"disabled":""}><span aria-hidden="true"></span></button>`;
+}
+
 function renderOverview(nodes) {
-  $("overview-rows").innerHTML=nodes.length ? nodes.map(node=>{
+  overviewRows.innerHTML=nodes.length ? nodes.map(node=>{
     const gpus=node.latest?.gpus ?? [];
     const fresh=!stale(node);
     const state=fresh?"在线":node.latest?"数据过期":"等待采集";
     const installed=gpus.length;
     const used=gpus.map(g=>g.used).filter(Number.isFinite);
     const workerCount=state=>gpus.filter(g=>g.worker_state===state).length;
-    return `<tr><td><strong>${escape(nodeTitle(node))}</strong></td>
+    return `<tr data-node-order="${escape(nodeKey(node))}"><td><div class="overview-node">
+      ${nodeGrip(node,nodes.length<2)}<strong>${escape(nodeTitle(node))}</strong></div></td>
       <td><span class="state ${fresh?"":"late"}">${state}</span></td>
       <td>${fresh?gpus.length:0} / ${installed||"—"}</td>
       <td>${fresh?percent(avg(gpus.map(g=>g.util))):"—"}</td>
@@ -81,23 +123,32 @@ noteDialog.querySelector("form").addEventListener("submit",event=>{
 });
 
 function renderNodes() {
-  const nodes = scope.snapshot.nodes;
+  const nodes=orderedNodes();
   const available = nodes.filter(n=>!stale(n));
   const all = available.flatMap(n=>n.latest.gpus);
   const totals = [all.length + " / " + sum(nodes.map(n=>n.latest?.gpus.length)), percent(avg(all.map(g=>g.util))),
     all.length ? memory(sum(all.map(g=>g.used))) : "—",
     available.length ? sum(available.map(n=>n.latest.processes.length)) : "—"];
   $("summary").querySelectorAll(".stat-v").forEach((e,i)=>{e.textContent=totals[i];});
-  $("nodes").innerHTML = nodes.map((n,i)=>{
-    const gpus=n.latest?.gpus || [];
-    const state=stale(n)?"数据过期":"在线";
-    return `<div class="node-tile"><button class="node" type="button" data-node="${i}" aria-pressed="${i===scope.node}">
+  if (!nodeDrag) {
+    const focused=document.activeElement?.dataset.nodeGrip;
+    const focusView=nodeOrderViews.find(view=>view.contains(document.activeElement));
+    nodeGrid.innerHTML=nodes.map(n=>{
+      const id=escape(nodeKey(n));
+      const gpus=n.latest?.gpus || [];
+      const state=stale(n)?"数据过期":"在线";
+      return `<div class="node-tile" data-node-order="${id}"><button class="node" type="button" data-node="${id}" aria-pressed="${n===current()}">
       <span class="node-top"><strong title="${escape(nodeTitle(n))}">${escape(nodeTitle(n))}</strong><span class="state ${stale(n)?"late":""}">${state}</span></span>
       <span class="node-note">${escape(nodeNotes.has(nodeKey(n))?n.name:gpus[0]?.name ?? n.name)}</span>
       <span class="tiles">${gpus.map(g=>`<span title="${escape(deviceLabel(g))} · ${percent(g.util)}"><small>${escape(deviceLabel(g))}</small><b>${percent(g.util)}</b></span>`).join("")}</span>
-    </button><button class="node-edit" type="button" data-note="${i}" aria-label="编辑 ${escape(nodeKey(n))} 的备注">备注</button></div>`;
-  }).join("");
-  renderOverview(nodes);
+    </button><button class="node-edit" type="button" data-note="${id}" aria-label="编辑 ${id} 的备注">备注</button>
+      ${nodeGrip(n,nodes.length<2)}</div>`;
+    }).join("");
+    renderOverview(nodes);
+    if (focusView && focused!==undefined) {
+      [...focusView.querySelectorAll("[data-node-grip]")].find(grip=>grip.dataset.nodeGrip===focused)?.focus({preventScroll:true});
+    }
+  }
   const connection=$("connection");
   const ready=nodes.length>0 && available.length===nodes.length && !scope.disconnected;
   connection.textContent=ready?"采集中":scope.disconnected?"连接重试中":available.length?"部分在线":"等待采集";
@@ -324,17 +375,79 @@ window.addEventListener("keydown",event=>{
   }
 });
 
-$("nodes").addEventListener("click",e=>{
+function beginNodeDrag(event) {
+  const grip=event.target.closest("[data-node-grip]");
+  if (!grip || grip.disabled || !event.isPrimary || event.button!==0 || nodeDrag) return;
+  nodeDrag={pointer:event.pointerId,grip,view:event.currentTarget,source:grip.closest("[data-node-order]"),target:null};
+  grip.setPointerCapture(event.pointerId);
+  nodeDrag.source.classList.add("node-dragging");
+}
+
+function updateNodeDrag(event) {
+  if (nodeDrag?.pointer!==event.pointerId) return;
+  const item=document.elementFromPoint(event.clientX,event.clientY)?.closest("[data-node-order]");
+  const target=item && nodeDrag.view.contains(item) && item!==nodeDrag.source ? item : null;
+  if (nodeDrag.target===target) return;
+  nodeDrag.target?.classList.remove("node-drop-target");
+  target?.classList.add("node-drop-target");
+  nodeDrag.target=target;
+}
+
+function finishNodeDrag(commit=false) {
+  if (!nodeDrag) return;
+  const {grip,pointer,source,target}=nodeDrag;
+  nodeDrag=null;
+  if (grip.hasPointerCapture(pointer)) grip.releasePointerCapture(pointer);
+  if (commit && target) moveNode(source.dataset.nodeOrder,target.dataset.nodeOrder);
+  renderNodes();
+}
+
+function dropNode(event) {
+  if (nodeDrag?.pointer!==event.pointerId) return;
+  updateNodeDrag(event);
+  finishNodeDrag(true);
+}
+
+function moveNodeWithKeys(event) {
+  const grip=event.target.closest("[data-node-grip]");
+  const offset={ArrowLeft:-1,ArrowUp:-1,ArrowRight:1,ArrowDown:1}[event.key];
+  if (!grip || !offset || nodeDrag) return;
+  event.preventDefault();
+  const order=orderedNodes().map(nodeKey);
+  const id=grip.dataset.nodeGrip;
+  const next=order[order.indexOf(id)+offset];
+  if (next) {
+    moveNode(id,next);
+    renderNodes();
+  }
+}
+
+for (const view of nodeOrderViews) {
+  view.addEventListener("pointerdown",beginNodeDrag);
+  view.addEventListener("pointermove",updateNodeDrag);
+  view.addEventListener("pointerup",dropNode);
+  view.addEventListener("keydown",moveNodeWithKeys);
+  for (const name of ["pointercancel","lostpointercapture"]) {
+    view.addEventListener(name,event=>{
+      if (nodeDrag?.pointer===event.pointerId) finishNodeDrag();
+    });
+  }
+}
+window.addEventListener("blur",()=>finishNodeDrag());
+window.addEventListener("keydown",event=>{
+  if (event.key==="Escape") finishNodeDrag();
+});
+nodeGrid.addEventListener("click",e=>{
   const edit=e.target.closest("[data-note]");
   if (edit) {
-    const node=scope.snapshot.nodes[Number(edit.dataset.note)];
+    const node=findNode(edit.dataset.note);
     if (node) editNote(node);
     return;
   }
   const button=e.target.closest("[data-node]");
   if (!button) return;
   finishCardDrag();
-  scope.node=Number(button.dataset.node);renderNodes();renderCards();renderProcesses();draw();
+  scope.node=button.dataset.node;renderNodes();renderCards();renderProcesses();draw();
 });
 cardGrid.addEventListener("click",e=>{
   if (ignoreCardClick && e.detail) {
