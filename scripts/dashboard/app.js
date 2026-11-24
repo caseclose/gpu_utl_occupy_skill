@@ -33,22 +33,58 @@ const classFor = category => ({占卡:"keepalive",训练:"training",推理:"infe
 
 const nodeKey=node=>node.name;
 const nodeNotes=new Map();
-const nodeNotesKey="gpu-dashboard-node-notes";
-const nodeOrderKey="gpu-dashboard-node-order";
 const nodeGrid=$("nodes");
 const overviewRows=$("overview-rows");
 const nodeOrderViews=[nodeGrid,overviewRows];
 let nodeOrder=[], nodeDrag=null;
-try {
-  const saved=JSON.parse(localStorage.getItem(nodeOrderKey));
-  if (Array.isArray(saved)) nodeOrder=[...new Set(saved.filter(id=>typeof id==="string"))];
-} catch {}
-try {
-  const saved=JSON.parse(localStorage.getItem(nodeNotesKey) || "{}");
-  for (const [id,note] of Object.entries(saved)) {
-    if (typeof note==="string" && note.length<=40 && note.trim()) nodeNotes.set(id,note.trim());
+let viewRevision=-1;
+let importingLegacy=false;
+
+function applyViewPreferences(preferences) {
+  if (!preferences || preferences.revision<=viewRevision) return;
+  viewRevision=preferences.revision;
+  nodeOrder=preferences.order;
+  nodeNotes.clear();
+  for (const [id,note] of Object.entries(preferences.notes)) nodeNotes.set(id,note);
+}
+
+async function saveViewPreferences(change) {
+  const error=$("view-preferences-error");
+  error.hidden=true;
+  try {
+    const response=await fetch("/api/view-preferences",{
+      method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify(change),signal:AbortSignal.timeout(5000),
+    });
+    const result=await response.json();
+    if (!response.ok || !result.ok) throw Error(result.error);
+    applyViewPreferences(result.view_preferences);
+    renderNodes();
+    return true;
+  } catch {
+    count(error,"共享显示偏好未保存，请重试");
+    error.hidden=false;
+    return false;
   }
-} catch {}
+}
+
+function importLegacyViewPreferences() {
+  if (viewRevision!==0 || importingLegacy || !scope.snapshot.nodes.length) return;
+  let legacy;
+  try {
+    const names=new Set(scope.snapshot.nodes.map(nodeKey));
+    const order=JSON.parse(localStorage.getItem("gpu-dashboard-node-order"));
+    const notes=JSON.parse(localStorage.getItem("gpu-dashboard-node-notes")) || {};
+    legacy={
+      order:Array.isArray(order)?order.filter(id=>names.has(id)):[],
+      notes:Object.fromEntries(Object.entries(notes).filter(([id,note])=>
+        names.has(id) && typeof note==="string" && note.trim() && note.length<=40)),
+    };
+  } catch { return; }
+  if (!legacy.order.length && !Object.keys(legacy.notes).length) return;
+  importingLegacy=true;
+  saveViewPreferences({import:legacy}).finally(()=>{importingLegacy=false;});
+}
 
 function nodeTitle(node) {
   return nodeNotes.get(nodeKey(node)) ?? node.name;
@@ -66,15 +102,12 @@ function orderedNodes() {
   return ordered.concat([...nodes.values()]);
 }
 
-function moveNode(id, destination) {
-  const order=orderedNodes().map(nodeKey);
-  const from=order.indexOf(id), to=order.indexOf(destination);
-  if (from===-1 || to===-1 || from===to) return;
-  order.splice(from,1);
-  order.splice(to,0,id);
-  nodeOrder=order;
-  try { localStorage.setItem(nodeOrderKey,JSON.stringify(order)); } catch {}
-  count($("node-order-status"),`${nodeTitle(findNode(id))} 已移到第 ${to+1} 位`);
+async function moveNode(id, destination) {
+  const node=findNode(id);
+  if (node && id!==destination && await saveViewPreferences({node:id,destination})) {
+    const position=orderedNodes().findIndex(n=>nodeKey(n)===id)+1;
+    if (position) count($("node-order-status"),`${nodeTitle(node)} 已移到第 ${position} 位`);
+  }
 }
 
 function nodeGrip(node,disabled) {
@@ -116,10 +149,7 @@ function editNote(node) {
 }
 noteDialog.querySelector("form").addEventListener("submit",event=>{
   if (event.submitter?.value!=="save" || editedNode===null) return;
-  const note=noteInput.value.trim();
-  if (note) nodeNotes.set(editedNode,note); else nodeNotes.delete(editedNode);
-  try { localStorage.setItem(nodeNotesKey,JSON.stringify(Object.fromEntries(nodeNotes))); } catch {}
-  renderNodes();
+  saveViewPreferences({node:editedNode,note:noteInput.value.trim()});
 });
 
 function renderNodes() {
@@ -263,6 +293,13 @@ async function hydrate() {
     const res=await fetch("/api/status",{cache:"no-store",signal:AbortSignal.timeout(7000)});
     if (!res.ok) throw Error("连接失败");
     scope.snapshot=await res.json();
+    applyViewPreferences(scope.snapshot.view_preferences);
+    importLegacyViewPreferences();
+    if (scope.snapshot.view_preferences_error) {
+      const error=$("view-preferences-error");
+      count(error,scope.snapshot.view_preferences_error);
+      error.hidden=false;
+    }
     scope.disconnected=false;
   } catch { scope.disconnected=true; }
   finally { scope.reading=false; }
@@ -418,7 +455,6 @@ function moveNodeWithKeys(event) {
   const next=order[order.indexOf(id)+offset];
   if (next) {
     moveNode(id,next);
-    renderNodes();
   }
 }
 

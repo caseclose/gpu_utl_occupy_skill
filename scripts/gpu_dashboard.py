@@ -1,4 +1,4 @@
-"""Serve a local NVIDIA dashboard for one or more configured telemetry sources."""
+"""Serve a local accelerator dashboard for one or more telemetry sources."""
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -10,6 +10,8 @@ import subprocess
 import sys
 import threading
 import time
+
+from view_preferences import ViewPreferences
 
 ASSETS = Path(__file__).resolve().parent / "dashboard"
 ROUTES = {
@@ -113,9 +115,10 @@ class Backend:
 
 
 class DashboardServer(ThreadingHTTPServer):
-    def __init__(self, port, backend):
+    def __init__(self, port, backend, preferences):
         super().__init__(("127.0.0.1", port), Handler)
         self.backend = backend
+        self.preferences = preferences
         self.host = "127.0.0.1:{}".format(self.server_port)
         self.origin = "http://" + self.host
 
@@ -152,7 +155,12 @@ class Handler(BaseHTTPRequestHandler):
         if not self.has_local_host():
             return
         if self.path == "/api/status":
-            self.send_json(200, self.server.backend.status())
+            snapshot = self.server.backend.status()
+            try:
+                snapshot["view_preferences"] = self.server.preferences.read()
+            except (OSError, ValueError):
+                snapshot["view_preferences_error"] = "无法读取共享显示偏好"
+            self.send_json(200, snapshot)
         elif self.path in ROUTES:
             filename, content_type = ROUTES[self.path]
             self.send_body(200, (ASSETS / filename).read_bytes(), content_type)
@@ -164,7 +172,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self.has_local_host():
             return
-        if (self.path != "/api/settings" or self.headers.get("Origin") != self.server.origin
+        if (self.path not in ("/api/settings", "/api/view-preferences")
+                or self.headers.get("Origin") != self.server.origin
                 or self.headers.get("Sec-Fetch-Site") not in (None, "same-origin")
                 or self.headers.get_content_type() != "application/json"):
             self.send_json(403, {"error": "仅允许从本机看板提交设置"})
@@ -175,8 +184,19 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("invalid body length")
             self.connection.settimeout(5)
             payload = json.loads(self.rfile.read(length))
+            if not isinstance(payload, dict):
+                raise ValueError("expected object")
         except (ValueError, OSError):
             self.send_json(400, {"error": "请求格式无效"})
+            return
+        if self.path == "/api/view-preferences":
+            try:
+                preferences = self.server.preferences.update(payload)
+                self.send_json(200, {"ok": True, "view_preferences": preferences})
+            except ValueError as error:
+                self.send_json(400, {"error": str(error)})
+            except OSError:
+                self.send_json(503, {"error": "无法保存共享显示偏好"})
             return
         try:
             result = self.server.backend.update(payload)
@@ -192,13 +212,16 @@ def main():
     args = parser.parse_args()
     if not 1 <= args.port <= 65535:
         parser.error("--port must be between 1 and 65535")
+    config_path = args.config.expanduser().resolve()
     try:
-        nodes = load_nodes(args.config)
+        nodes = load_nodes(config_path)
     except (OSError, ValueError) as error:
         parser.error(str(error))
 
     backend = Backend(nodes)
-    with DashboardServer(args.port, backend) as server:
+    preferences_path = config_path.with_name(config_path.name + ".view-preferences.json")
+    preferences = ViewPreferences(preferences_path, backend.nodes)
+    with DashboardServer(args.port, backend, preferences) as server:
         updater = threading.Thread(target=backend.run, daemon=True)
         updater.start()
         print("Dashboard: " + server.origin + "/", flush=True)

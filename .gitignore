@@ -1,2 +1,4 @@
 __pycache__/
 occupy_gpu.log
+*.view-preferences.json
+*.view-preferences.json.lock
