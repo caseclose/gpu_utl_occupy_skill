@@ -239,7 +239,7 @@ def vendor_process_rows(cards, reported, workers):
     return result
 
 
-def reconcile_workers(gpus, processes, config, pulse, workers, vendor_run=None):
+def reconcile_workers(gpus, processes, config, pulse, workers, vendor_run=None, recovery_revision=None):
     vendor_mode = vendor_run is not None
     index_uuid = {gpu["index"]: gpu["uuid"] for gpu in gpus}
     for uuid in workers.keys() - index_uuid.values():
@@ -256,7 +256,10 @@ def reconcile_workers(gpus, processes, config, pulse, workers, vendor_run=None):
         threshold = min(100, desired["target"] * 2 + 4) if child else desired["target"]
         paused = desired["enabled"] and index in external and (vendor_mode or (card["util"] or 0) >= threshold)
         controllable = card["controllable"] if vendor_mode else bool(pulse)
-        want = controllable and desired["enabled"] and not paused
+        saved_revision = config.get("card_revisions", {}).get(uuid, 0)
+        recovery_hold = (desired["enabled"] and recovery_revision is not None
+                         and saved_revision <= recovery_revision)
+        want = controllable and desired["enabled"] and not recovery_hold and not paused
         if child and (not want or child[1] != desired["target"] or child[0].poll() is not None):
             stop(workers.pop(uuid)[0])
             child = None
@@ -268,11 +271,12 @@ def reconcile_workers(gpus, processes, config, pulse, workers, vendor_run=None):
             )
             child = (worker, desired["target"])
             workers[uuid] = child
-        card.update(requested=desired, worker_pid=child[0].pid if child else None,
-                    worker_state="running" if child else "yielding" if paused else "off")
+        state = ("running" if child else "recovery_hold" if recovery_hold and controllable
+                 else "yielding" if paused else "off")
+        card.update(requested=desired, worker_pid=child[0].pid if child else None, worker_state=state)
 
 
-def supervise(directory, pulse=None, backend="cuda", device_map=None, size=2048):
+def supervise(directory, pulse=None, backend="cuda", device_map=None, size=2048, *, recover_monitor=False):
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     status_path = directory / "latest.json"
     config_path = directory / "config.json"
@@ -282,6 +286,8 @@ def supervise(directory, pulse=None, backend="cuda", device_map=None, size=2048)
             fcntl.flock(config_lock, fcntl.LOCK_EX)
             if not config_path.exists():
                 publish(config_path, dict(revision=1, cards={}))
+            recovery_revision = (json.loads(config_path.read_text(encoding="utf-8"))["revision"]
+                                 if recover_monitor else None)
         signal.signal(signal.SIGTERM, mark_stop)
         signal.signal(signal.SIGINT, mark_stop)
         workers, active = {}, {}
@@ -310,7 +316,7 @@ def supervise(directory, pulse=None, backend="cuda", device_map=None, size=2048)
                             card["controllable"] = complete and card["util"] is not None and card["uuid"] in (device_map or {})
                         processes, candidates = vendor_process_rows(cards, reported, workers), []
                     reconcile_workers(gpus, processes, config, pulse, workers,
-                                      vendor_run if backend != "cuda" else None)
+                                      vendor_run if backend != "cuda" else None, recovery_revision)
                     current = {}
                     for p in processes:
                         # GPU index and observed PID allow consistency even when namespace metadata becomes available later.
@@ -330,7 +336,7 @@ def supervise(directory, pulse=None, backend="cuda", device_map=None, size=2048)
                         append(directory, "events", dict(time=now, action="离开", **active[key]), now)
                     active = current
                     control_available = bool(pulse) if backend == "cuda" else any(g["controllable"] for g in gpus)
-                    publish(status_path, dict(time=now, backend=backend, controllable=control_available, gpus=gpus,
+                    publish(status_path, dict(time=now, pid=os.getpid(), backend=backend, controllable=control_available, gpus=gpus,
                                               processes=processes, candidates=candidates, revision=config["revision"]))
                     append(directory, "metrics", dict(t=now, g={
                         (g["index"] if backend == "cuda" else g["uuid"]):

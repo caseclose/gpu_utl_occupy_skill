@@ -11,7 +11,7 @@ from unittest.mock import Mock, patch
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 sys.path[:0] = [str(SCRIPTS / "dashboard")]
-from agent import update
+from agent import main, update
 from collector import reconcile_workers
 
 
@@ -38,6 +38,7 @@ class DashboardAgentTests(unittest.TestCase):
         accepted = self.request([self.gpu_b], target=35)
         self.assertTrue(accepted["ok"])
         self.assertEqual(accepted["config"]["cards"], {self.gpu_b: {"enabled": True, "target": 35}})
+        self.assertEqual(accepted["config"]["card_revisions"], {self.gpu_b: 2})
         self.assertEqual(self.request([self.gpu_a])["status"], 409)
         with self.assertRaises(ValueError):
             self.request(["GPU-unlisted"], revision=2)
@@ -73,6 +74,44 @@ class DashboardAgentTests(unittest.TestCase):
             second.terminate.assert_called_once()
             self.assertFalse(running)
             self.assertEqual(spawn.call_count, 2)
+
+    def test_recovery_holds_saved_load_until_a_new_request_for_each_card(self):
+        cases = (("cuda", None), ("mlu", Mock()), ("npu", Mock()))
+        for backend, vendor_run in cases:
+            with self.subTest(backend=backend):
+                self.save("config.json", {"revision": 4, "cards": {
+                    self.gpu_a: {"enabled": True, "target": 60},
+                    self.gpu_b: {"enabled": True, "target": 75},
+                }})
+                cards = [{"index": i, "uuid": uuid, "util": 0, "controllable": True}
+                         for i, uuid in enumerate((self.gpu_a, self.gpu_b))]
+                workers = {}
+                with patch("collector.subprocess.Popen") as spawn:
+                    config = json.loads((self.state / "config.json").read_text())
+                    reconcile_workers(cards, [], config, "/example/pulse", workers,
+                                      vendor_run, recovery_revision=4)
+                    self.assertEqual([c["worker_state"] for c in cards], ["recovery_hold"] * 2)
+                    self.assertFalse(workers)
+                    updated = self.request([self.gpu_b], revision=4, target=80)
+                    self.assertTrue(updated["ok"])
+                    reconcile_workers(cards, [], updated["config"], "/example/pulse", workers,
+                                      vendor_run, recovery_revision=4)
+                    self.assertEqual([c["worker_state"] for c in cards], ["recovery_hold", "running"])
+                    self.assertEqual(set(workers), {self.gpu_b})
+                    if vendor_run is None:
+                        spawn.assert_called_once()
+                        self.assertEqual(spawn.call_args.kwargs["env"]["CUDA_VISIBLE_DEVICES"], self.gpu_b)
+                    else:
+                        spawn.assert_not_called()
+                        vendor_run.assert_called_once_with(cards[1], 80)
+
+    def test_recovery_keeps_telemetry_when_control_dependencies_are_unavailable(self):
+        args = ["agent.py", "collect", "--state", str(self.state), "--backend", "npu",
+                "--device-map", str(self.state / "missing.json"), "--recover-monitor"]
+        with patch("sys.argv", args), patch("agent.supervise") as start, patch("sys.stderr"):
+            main()
+        start.assert_called_once_with(self.state.resolve(), None, "npu", None, 2048,
+                                      recover_monitor=True)
 
 
 if __name__ == "__main__":

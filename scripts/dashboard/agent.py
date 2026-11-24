@@ -4,6 +4,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import time
 
@@ -72,8 +73,10 @@ def update(directory, payload):
         config = read(path)
         if config is None or config["revision"] != rev:
             return dict(ok=False, status=409, error="设置已更新，请刷新后重试")
+        card_revisions = config.setdefault("card_revisions", {})
         for card in cards:
             config["cards"][card] = dict(enabled=enabled, target=target)
+            card_revisions[card] = rev + 1
         now = int(time.time())
         config.update(revision=rev + 1, time=now)
         publish(path, config)
@@ -91,6 +94,8 @@ def main():
     parser.add_argument("--device-map", type=Path,
                         help="opt in to MLU/NPU control using a JSON monitor ID to logical index map")
     parser.add_argument("--size", type=int, default=2048, help="MLU/NPU worker matrix edge length")
+    parser.add_argument("--recover-monitor", action="store_true",
+                        help="restore telemetry and wait for fresh per-card commands before starting occupancy")
     args = parser.parse_args()
     directory = args.state.expanduser().resolve()
     os.umask(0o077)
@@ -100,14 +105,19 @@ def main():
             parser.error("use --pulse for CUDA and --device-map for MLU/NPU")
         if args.size < 1:
             parser.error("--size must be positive")
-        if pulse and (not pulse.is_file() or not os.access(str(pulse), os.X_OK)):
-            parser.error("--pulse must point to an executable file")
         try:
+            if pulse and (not pulse.is_file() or not os.access(str(pulse), os.X_OK)):
+                raise ValueError("--pulse must point to an executable file")
             mapping = load_device_map(args.device_map.expanduser(), args.backend) if args.device_map else None
-        except (OSError, ValueError) as error:
-            parser.error(str(error))
-        supervise(directory, pulse, args.backend, mapping, args.size)
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            if not args.recover_monitor:
+                parser.error(str(error))
+            print(f"Control unavailable; recovering telemetry only: {error}", file=sys.stderr)
+            pulse, mapping = None, None
+        supervise(directory, pulse, args.backend, mapping, args.size, recover_monitor=args.recover_monitor)
         return
+    if args.recover_monitor:
+        parser.error("--recover-monitor requires collect")
     if args.action == "snapshot":
         result = snapshot(directory)
     else:

@@ -20,7 +20,7 @@ python3 scripts/dashboard/agent.py collect \
   --pulse ~/.local/state/gpu-occupy/dashboard/pulse
 ```
 
-每台节点只需运行一个采集器。主机长期采集时，用该主机已有的服务管理方式运行 `collect`。首次启动时所有 GPU 的占卡开关均关闭。设备设置按 GPU UUID 保存，重启采集器后沿用已保存的设置。最低优先级 CUDA stream 按占空比发短脉冲，整卡利用率以驱动实测为准。
+每台节点只需运行一个采集器。首次启动时所有 GPU 的占卡开关均关闭。设备设置按 GPU UUID 保存，手动启动 `collect` 时沿用已保存的设置。最低优先级 CUDA stream 按占空比发短脉冲，整卡利用率以驱动实测为准。
 
 ## 寒武纪 MLU 和华为昇腾 NPU 节点
 
@@ -43,6 +43,23 @@ python3 scripts/dashboard/agent.py collect --backend mlu \
 ```
 
 NPU 使用同样的方式，将 `--backend` 改为 `npu` 并使用对应的状态目录和映射。NPU ID 示例为 `NPU-0000:87:00.0-1`，末位是芯片 ID。同一节点只映射需要控制的卡。可用 `--size` 调整占卡矩阵边长。MLU／NPU 检测到其他设备进程时会释放自己的 worker。设备进程表无法可靠读取时，控制暂不可用。厂商工具只返回宿主机 PID、采集器又无法匹配容器内 worker 时，优先在能看见对应进程的节点环境运行采集器。
+
+## 自动恢复采集
+
+在每台需要守护的 Linux 设备节点上运行 `scripts/dashboard/watchdog.sh`。首个参数为采集器的状态目录，后续参数沿用该节点的硬件和占卡选项。守护程序需要 Bash 和 util-linux 提供的 `flock`、`setsid`，并继承启动时的 Python 环境。需要指定解释器时，可设置 `GPU_OCCUPY_PYTHON`。
+
+```bash
+# NVIDIA 只读监控
+scripts/dashboard/watchdog.sh ~/.local/state/gpu-occupy/dashboard
+
+# MLU 监控和手动占卡控制
+scripts/dashboard/watchdog.sh ~/.local/state/gpu-occupy/mlu \
+  --backend mlu --device-map /path/to/mlu-map.json
+```
+
+需要控制 NVIDIA 时传入 `--pulse`。NPU 节点使用 `--backend npu` 和对应的状态目录及设备映射。长期运行时，由该节点已有的服务管理器托管守护程序。守护程序启动时立即检查一次，之后每 15 分钟检查采集器锁。发现采集器退出会自动启动采集，并将输出写入状态目录的 `collector.log`。中断可能持续到下一轮检查。整个容器被停止或重建时，需要随容器重新启动守护程序。
+
+自动恢复会保留已保存的目标值。原本启用的卡显示「待重新开启」，在网页上选择卡并点击「开启 / 更新」后，才会对这些卡启动占卡。占卡依赖失效时，自动恢复会先启动只读采集。看板采样超过 30 秒未更新时会显示「数据过期」。
 
 ## 在查看端启动网页
 

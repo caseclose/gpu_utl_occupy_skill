@@ -127,10 +127,11 @@ function renderCards() {
   $("gpu-table").tBodies[0].innerHTML=gpus.map(g=>{
     const desired=settings?.cards?.[g.uuid] ?? g.requested;
     const pending=desired?.enabled!==g.requested?.enabled || desired?.target!==g.requested?.target;
-    const status=pending?"待生效":{off:"已关闭",running:"占卡中",yielding:"任务优先"}[g.worker_state];
+    const status=pending?"待生效":{off:"已关闭",running:"占卡中",yielding:"任务优先",recovery_hold:"待重新开启"}[g.worker_state];
     return `<tr><td><button type="button" class="gpu-pick" data-gpu="${g.index}" aria-pressed="${g.index===scope.card}">${escape(deviceLabel(g))}</button></td>
     <td>${meter(g.util,percent(g.util))}</td><td>${meter(ratio(g.used,g.total),memory(g.used)+" / "+memory(g.total))}</td>
-    <td>${num(g.temp)} °C</td><td>${num(g.power)} W</td><td><span class="pill-status ${g.worker_state==="off"?"off":""}">${escape(status)}</span> ${desired?.enabled?percent(desired.target):""}</td></tr>`;
+    <td>${num(g.temp)} °C</td><td>${num(g.power)} W</td><td><span class="pill-status ${["off","recovery_hold"].includes(g.worker_state)?"off":""}"
+    ${g.worker_state==="recovery_hold"?'title="监控已恢复，可手动重新开启占卡"':""}>${escape(status)}</span> ${desired?.enabled?percent(desired.target):""}</td></tr>`;
   }).join("");
   for (const btn of $("cards").querySelectorAll("button")) {
     const id=btn.dataset.card;

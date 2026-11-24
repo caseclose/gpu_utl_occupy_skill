@@ -21,4 +21,6 @@ description: 在指定 NVIDIA GPU、寒武纪 MLU 或华为昇腾 NPU 上产生�
 
 用户要持续监控、查设备进程来源或从浏览器控制占卡时，使用 [网页看板](references/dashboard.md)。在目标节点按硬件选择采集后端，在查看端启动本机网页。默认只读。NVIDIA 用 CUDA worker 启用控制，MLU 和 NPU 要先核对监控设备与 PyTorch 逻辑编号的对应关系。
 
+用户要求监控进程被杀后自动恢复时，在设备节点运行 [监控守护程序](references/dashboard.md#自动恢复采集)。它每 15 分钟检查一次，自动恢复采集后保留占卡目标，等用户在网页上重新开启所选卡。
+
 完整参数和真机验收步骤见 [README.md](README.md)。
