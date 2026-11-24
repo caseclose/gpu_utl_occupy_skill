@@ -1,6 +1,16 @@
 # gpu_utl_occupy_skill
 
-用矩阵乘法在指定的 NVIDIA GPU、寒武纪 MLU 或华为昇腾 NPU 上产生计算负载。用 `--pct` 指定目标利用率，默认 100%。支持独立命令行和 [Claude / CodeBuddy Skill](SKILL.md)。
+用矩阵乘法在指定的 NVIDIA GPU、寒武纪 MLU 或华为昇腾 NPU 上产生计算负载。用 `--pct` 指定目标利用率，默认 100%。可独立通过命令行运行，也可作为符合 Agent Skills 格式的 `gpu-occupy` 技能安装。 [技能入口](SKILL.md) · [Agent Skills 规范](https://agentskills.io/specification)
+
+## 安装为 Agent Skill
+
+在项目目录运行以下命令，按提示选择 Codex、Claude Code、Cursor、OpenCode、GitHub Copilot、Gemini CLI、CodeBuddy 等一个或多个 agent。需要用户级安装时加 `-g`。 [安装器支持的 agent 和目录](https://github.com/vercel-labs/skills/blob/main/docs/agents.md)
+
+```bash
+npx skills add caseclose/gpu_utl_occupy_skill --skill gpu-occupy
+```
+
+也可以把仓库克隆到当前 agent 会扫描的技能目录中，并将技能文件夹命名为 `gpu-occupy`。安装时一起保留 `SKILL.md`、`scripts/` 和 `references/`。在 agent 中请求使用 `gpu-occupy`，例如「用 gpu-occupy 查看这台节点上 CUDA 卡的状态」。运行负载脚本仍需要目标 Linux 节点上的对应驱动和 Python 环境。
 
 ## 快速开始
 
